@@ -1,0 +1,35 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local credentials (never commit the real .env file).
+.env
+.env.*
+!.env.example
+
+# Scraping outputs and temporary/debug data
+/movement/
+/movement_*/
+/ais_positions/
+/AISデータ_*/
+/LNG_*/
+debug/
+_tmp/
+*.log
+*.zip
+
+# Local scraper state and browser downloads.
+/_downloads/
+/**/_downloads/
+
+# Local retry lists and one-off execution helpers
+/bad_*.txt
+/merge_completed_*.ps1
+/rerun_bad_*.py
+/run_movement_*.py
+/notebook_execution.*
+
+# Root-level reference/output CSVs are not required by the scrapers.
+/*.csv
