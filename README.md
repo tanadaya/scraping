@@ -14,12 +14,22 @@ Chrome がインストールされている必要があります。
 
 認証情報はソースコードやノートブックに書かず、環境変数で指定してください。
 `.env.example` を `.env` にコピーして値を設定する方法と、PowerShellで直接設定する方法があります。
+Movementの2つのノートブックは別アカウントを使用します。
 
     Copy-Item .env.example .env
     # .env を編集して実際の値を入力
 
-    $env:SEASEARCHER_LOGIN_USER = "your-user@example.com"
-    $env:SEASEARCHER_LOGIN_PASSWORD = "your-password"
+    # scraping_seasearcher.ipynb（ノート1）
+    $env:SEASEARCHER_LOGIN_USER_1 = "notebook-1-user@example.com"
+    $env:SEASEARCHER_LOGIN_PASSWORD_1 = "notebook-1-password"
+
+    # scraping_seasearcher_2.ipynb（ノート2）
+    $env:SEASEARCHER_LOGIN_USER_2 = "notebook-2-user@example.com"
+    $env:SEASEARCHER_LOGIN_PASSWORD_2 = "notebook-2-password"
+
+    # AIS Positions・Vesselsノートブック、utility直接利用時（必要な場合）
+    $env:SEASEARCHER_LOGIN_USER = "shared-user@example.com"
+    $env:SEASEARCHER_LOGIN_PASSWORD = "shared-password"
 
 ## Notebooks
 
