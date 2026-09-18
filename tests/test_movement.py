@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-import utils_scraping_seasearcher as movement
+from tools.scrapers import movement
 
 
 class MovementNoDataClassificationTests(unittest.TestCase):

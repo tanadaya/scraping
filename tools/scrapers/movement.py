@@ -1,6 +1,6 @@
 """Coordinated public facade for the SeaSearcher Movement scraper.
 
-The scraper implementation lives in ``_utils_scraping_seasearcher_impl.py``.
+The Selenium implementation lives in ``movement_impl.py``.
 Keeping coordination in this thin facade makes the shared-account lock easy to
 maintain without mixing Google Sheets concerns into the Selenium implementation.
 """
@@ -12,13 +12,13 @@ import sys
 import types
 from typing import Any
 
-from scraping_coordinator import (
+from tools.coordinator.coordinator import (
     coordinated_job,
     infer_seasearcher_account_id,
     track_unique_function_calls,
 )
 
-_impl = importlib.import_module("_utils_scraping_seasearcher_impl")
+_impl = importlib.import_module("tools.scrapers.movement_impl")
 
 
 def parallel_scraping(llino_list, max_workers=1, driver_opts=None, config=None):

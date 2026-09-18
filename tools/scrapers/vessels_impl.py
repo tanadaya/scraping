@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import utils_scraping_seasearcher as base
+from . import movement as base
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys

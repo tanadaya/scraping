@@ -7,13 +7,13 @@ import sys
 import types
 from typing import Any
 
-from scraping_coordinator import (
+from tools.coordinator.coordinator import (
     coordinated_job,
     infer_seasearcher_account_id,
     track_unique_function_calls,
 )
 
-_impl = importlib.import_module("_utils_scraping_seasearcher_vessels_impl")
+_impl = importlib.import_module("tools.scrapers.vessels_impl")
 
 
 def export_vessels_filters(filter_labels, config=None):

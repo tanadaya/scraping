@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import polars as pl
-import utils_scraping_seasearcher as base
+from . import movement as base
 from selenium import webdriver
 from selenium.common.exceptions import (
     ElementClickInterceptedException,

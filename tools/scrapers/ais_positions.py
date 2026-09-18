@@ -7,13 +7,13 @@ import sys
 import types
 from typing import Any
 
-from scraping_coordinator import (
+from tools.coordinator.coordinator import (
     coordinated_job,
     infer_seasearcher_account_id,
     track_unique_function_calls,
 )
 
-_impl = importlib.import_module("_utils_scraping_seasearcher_ais_positions_impl")
+_impl = importlib.import_module("tools.scrapers.ais_positions_impl")
 
 
 def parallel_scraping_ais_positions(llino_list, max_workers=1, driver_opts=None, config=None):

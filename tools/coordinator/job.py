@@ -7,11 +7,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
-from scraping_coordinator_core import (
+from .core import (
     CoordinatorError, CoordinatorUnavailableError, _format_eta, _utc_now_iso,
 )
 if TYPE_CHECKING:
-    from scraping_coordinator_core import ScrapeCoordinatorClient
+    from .core import ScrapeCoordinatorClient
 
 class BypassJobLease:
     """Explicit emergency bypass.  It is never selected automatically."""

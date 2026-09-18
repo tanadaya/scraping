@@ -1,0 +1,28 @@
+[project]
+name = "seasearcher"
+version = "0.1.0"
+description = "Local SeaSearcher scraping notebooks and tools"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # read_html also needs the optional HTML parsers.
+    "pandas[html]>=2.2.3,<3",
+    "polars>=1.0,<2",
+    "python-dotenv>=1.0,<2",
+    "selenium>=4.26,<5",
+    "webdriver-manager>=4.0,<5",
+]
+
+[dependency-groups]
+# VS Code notebooks only need a kernel, not a Jupyter server.
+notebook = ["ipykernel>=6.29,<8"]
+lab = [
+    { include-group = "notebook" },
+    "jupyterlab>=4.3,<5",
+]
+
+[tool.uv]
+required-version = ">=0.9.0"
+# Run the tools from this checkout; this project is not a published package.
+package = false
+default-groups = ["notebook"]

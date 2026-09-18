@@ -37,7 +37,7 @@ SeaSearcher のユーザー名・パスワードは Sheet や Apps Script に保
 
 ## 5. 各 PC の `.env`
 
-`.env.example` をコピーし、次を設定します。
+プロジェクトのルートで `.env.example` を `.env` にコピーし、次を設定します。
 
 ```env
 SCRAPE_COORDINATOR_URL=https://script.google.com/macros/s/...../exec
@@ -45,12 +45,12 @@ SCRAPE_COORDINATOR_TOKEN=ここにScript Propertiesと同じ値
 SCRAPE_OPERATOR=利用者の名前
 ```
 
-Movement notebook 1 / 2 は専用のログインユーザーから `account_1` / `account_2` を自動判定します。AIS Positions / Vessels など generic login を使う処理は、そのユーザーが `_1` / `_2` と一致しない場合 `.env` の `SEASEARCHER_ACCOUNT_ID=account_1` または `account_2` を設定してください。
+Movement / AIS Positions notebook 1 / 2 は、それぞれの番号に対応する `account_1` / `account_2` を使います。Vesselsなどgeneric loginを使う処理は、そのユーザーが `_1` / `_2` と一致しない場合 `.env` の `SEASEARCHER_ACCOUNT_ID=account_1` または `account_2` を設定してください。
 
 ## 6. 動作確認
 
 ```powershell
-python scraping_coordinator.py status
+uv run --locked python -m tools.coordinator status
 ```
 
 設定が正しければ `account_1` / `account_2` の状態が表示されます。

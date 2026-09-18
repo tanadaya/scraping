@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import utils_scraping_seasearcher_ais_positions as ais
+from tools.scrapers import ais_positions as ais
 
 
 class FakeElement:

@@ -19,19 +19,19 @@ except Exception:  # optional convenience only
 if load_dotenv is not None:
     load_dotenv()
 
-from scraping_coordinator_core import (
+from .core import (
     AppsScriptTransport, CoordinatorError, CoordinatorIdentity,
     CoordinatorLeaseLostError, CoordinatorUnavailableError,
     ScrapeCoordinatorClient, _format_eta, _truthy,
 )
-from scraping_coordinator_job import BypassJobLease, JobLease
+from .job import BypassJobLease, JobLease
 
 def infer_seasearcher_account_id(config: dict[str, Any] | None = None) -> str:
     """Resolve account_1/account_2 without storing credentials in the coordinator.
 
-    High-level Movement notebooks pass their dedicated login_user, so they are
-    matched automatically against SEASEARCHER_LOGIN_USER_1/_2.  AIS/Vessels can
-    either use the same users or set SEASEARCHER_ACCOUNT_ID explicitly.
+    Scraper notebooks may pass coordinator_account_id explicitly.  Otherwise a
+    configured login user is matched against SEASEARCHER_LOGIN_USER_1/_2, and
+    generic users can use SEASEARCHER_ACCOUNT_ID explicitly.
     """
     cfg = config or {}
     explicit = str(cfg.get("coordinator_account_id") or "").strip()

@@ -7,22 +7,24 @@ Seasearcher の `Movements > AIS Positions` を取得するための実行手順
 ----
 - Python 3.10 以上
 - Google Chrome
-- `requirements.txt` の依存関係がインストール済み
+- uvで依存関係とノートブック用カーネルがインストール済み
 
 セットアップ
 ------------
-PowerShell で実行します。
+uvをインストール後、プロジェクトのルートで実行します。
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+uv sync --locked
 ```
+
+VS Codeのノートブックでは、このプロジェクトの `.venv` をカーネルに選びます。
+初回導入や別のPythonを使う手順は [`environment.md`](environment.md) を参照してください。
 
 実行方法 1: ノートブックから実行
 ------------------------------
 使うファイル:
-- `scraping_seasearcher_ais_positions.ipynb`
+- `notebooks/ais_positions_account_1.ipynb`
+- `notebooks/ais_positions_account_2.ipynb`
 - `vessel/` 配下の任意の vessel CSV 1 ファイル
 - または従来の船種別 CSV 群 (`vessels_202504_<vessel_type>.csv` など)
 
@@ -122,7 +124,7 @@ SOURCE_CONFIG = {
 ```
 
 実行手順:
-1. `scraping_seasearcher_ais_positions.ipynb` を開く
+1. 使用するアカウントに対応する `notebooks/ais_positions_account_1.ipynb` または `notebooks/ais_positions_account_2.ipynb` を開く
 2. `SOURCE_CONFIG` を編集する
 3. `RUN_CONFIG` を編集する
 4. `run_context = ...` のセルで対象 LLI と `out_dir` を確認する
@@ -133,7 +135,7 @@ SOURCE_CONFIG = {
 ------------------------------
 
 ```python
-import utils_scraping_seasearcher_ais_positions as sss_ais
+from tools.scrapers import ais_positions as sss_ais
 
 targets = [101474, 12903339]
 

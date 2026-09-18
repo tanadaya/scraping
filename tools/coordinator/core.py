@@ -161,7 +161,7 @@ class ScrapeCoordinatorClient:
         total: int | None = None,
         description: str | None = None,
     ) -> "JobLease":
-        from scraping_coordinator_job import JobLease
+        from .job import JobLease
         return JobLease(
             client=self,
             account_id=account_id,

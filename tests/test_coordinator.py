@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest import mock
 
-import scraping_coordinator as coordinator
+from tools.coordinator import coordinator
 
 
 class FakeTransport:
@@ -52,7 +52,7 @@ class CoordinatorTests(unittest.TestCase):
             progress_push_interval_seconds=2,
         )
         job = client.job(account_id="account_1", job_type="movement", total=10)
-        with mock.patch("scraping_coordinator.time.sleep", return_value=None):
+        with mock.patch("tools.coordinator.coordinator.time.sleep", return_value=None):
             with job:
                 job.progress_callback(completed=0, total=10, stage="local_skip")
                 job.progress_callback(completed=2, total=10, stage="scrape")
