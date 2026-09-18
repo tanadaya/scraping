@@ -60,7 +60,7 @@ def _format_eta(value: Any) -> str:
 class AppsScriptTransport:
     """Tiny JSON-over-HTTP transport using only the Python standard library."""
 
-    def __init__(self, url: str, token: str, timeout: float = 20.0):
+    def __init__(self, url: str, token: str, timeout: float = 60.0):
         self.url = str(url or "").strip()
         self.token = str(token or "").strip()
         self.timeout = float(timeout)
@@ -146,7 +146,11 @@ class ScrapeCoordinatorClient:
         url = os.getenv("SCRAPE_COORDINATOR_URL", "").strip()
         token = os.getenv("SCRAPE_COORDINATOR_TOKEN", "").strip()
         return cls(
-            AppsScriptTransport(url, token),
+            AppsScriptTransport(
+                url,
+                token,
+                timeout=float(os.getenv("SCRAPE_COORDINATOR_TIMEOUT_SECONDS", "60")),
+            ),
             CoordinatorIdentity.current(operator),
             poll_interval_seconds=float(os.getenv("SCRAPE_COORDINATOR_POLL_SECONDS", "20")),
             heartbeat_interval_seconds=float(os.getenv("SCRAPE_COORDINATOR_HEARTBEAT_SECONDS", "60")),

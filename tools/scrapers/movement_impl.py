@@ -30,7 +30,6 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -1443,7 +1442,10 @@ def initialize_driver(driver_opts=None, download_dir: str | Path | None = None):
 
     logger.info(f"Chrome WebDriver を初期化しています (headless={headless}, download_dir={download_path})")
     try:
-        driver = webdriver.Chrome(service=ChromeService(_resolve_chromedriver_path()), options=options)
+        # Let Selenium Manager select/download a driver that matches the
+        # installed Chrome version.  Passing a cached webdriver-manager path
+        # can silently select an obsolete driver after Chrome auto-updates.
+        driver = webdriver.Chrome(options=options)
     except Exception as e:
         logger.error(f"WebDriver の初期化に失敗しました: {e}", exc_info=True)
         raise
