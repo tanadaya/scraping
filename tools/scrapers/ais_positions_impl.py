@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pandas as pd
 import polars as pl
@@ -897,6 +898,7 @@ def _ais_browser_is_unresponsive(failure_flags: dict[str, bool]) -> bool:
 
 def _get_visible_grid_rows(driver) -> list:
     row_xpaths = [
+        "//table//tbody/tr[td]",
         "//tr[contains(@class,'parent-row')]",
         "//tr[contains(@class,'lli-table__row')]",
         "//div[contains(@class,'lli-table__row')]",
@@ -934,6 +936,7 @@ def _count_rows(driver) -> int:
 
 def _read_total_found_count(driver) -> int | None:
     candidate_xpaths = [
+        "//*[@data-testid='tableTotalResults']",
         "//*[@data-testid='itemsTotalCount']",
         "//*[contains(@class,'lli-gridz__total-count')]",
     ]
@@ -959,6 +962,20 @@ def _read_total_found_count(driver) -> int | None:
 
 def _read_pagination_state(driver) -> dict[str, int | None]:
     state = {"current_page": None, "total_pages": None}
+    for key, testid in (("current_page", "tableCurrentPage"), ("total_pages", "tableTotalPages")):
+        try:
+            for element in driver.find_elements(By.XPATH, f"//*[@data-testid='{testid}']"):
+                if not element.is_displayed():
+                    continue
+                digits = re.sub(r"[^\d]", "", element.text or "")
+                if digits:
+                    state[key] = int(digits)
+                    break
+        except Exception:
+            continue
+    if state["current_page"] is not None and state["total_pages"] is not None:
+        return state
+
     candidate_xpaths = [
         "//input[contains(@class,'lli-grid-pager__input')]",
         "//input[@type='number' and contains(@value,'')]",
@@ -1734,13 +1751,127 @@ def set_items_per_page_1000(driver, timeout: int = 20) -> None:
 
 
 def _ais_response_url_matches(url: str) -> bool:
-    """Match the normal AIS Positions data response, not an export request."""
-    value = str(url or "").lower()
-    return (
-        ("ais" in value or "position" in value)
-        and "export" not in value
-        and "download" not in value
+    """Match the AIS table endpoint, excluding map and export endpoints."""
+    return urlsplit(str(url or "")).path.lower().rstrip("/").endswith("/vessel/aismessages")
+
+
+def _ais_request_matches(request: dict, llino, period_cfg, page_index: int) -> bool:
+    """Identify the search by its filters, not by the response row count."""
+    url = request.get("url", "")
+    if not _ais_response_url_matches(url):
+        return False
+    try:
+        query = json.loads(parse_qs(urlsplit(url).query)["query"][0])
+        filters = query["Filters"]
+        vessel_ids = filters.get("vesselIds", [])
+        if len(vessel_ids) != 1 or _format_llino(vessel_ids[0]) != _format_llino(llino):
+            return False
+        # SeaSearcher's query builder sends zero-based PageNumber.
+        if query.get("PageNumber") != page_index - 1 or query.get("PageSize") != 1000:
+            return False
+        requested_bounds = _period_bounds(period_cfg)
+        actual_range = filters.get("dateRange")
+        if requested_bounds is None:
+            return actual_range is None or (
+                isinstance(actual_range, dict) and not actual_range.get("from") and not actual_range.get("to")
+            )
+        actual_from = pd.to_datetime(actual_range["from"], utc=True, errors="coerce")
+        actual_to = pd.to_datetime(actual_range["to"], utc=True, errors="coerce")
+        start, end = requested_bounds
+        expected_from = pd.Timestamp(start, tz="UTC")
+        expected_end = pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)
+        return bool(
+            actual_from == expected_from
+            and expected_end - pd.Timedelta(seconds=1) <= actual_to < expected_end
+        )
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def _ais_request_summary(request: dict) -> dict:
+    """Return only the query fields needed to diagnose request mismatches."""
+    url = request.get("url", "")
+    try:
+        query = json.loads(parse_qs(urlsplit(url).query)["query"][0])
+        filters = query.get("Filters", {})
+        return {
+            "page": query.get("PageNumber"),
+            "page_size": query.get("PageSize"),
+            "vessels": filters.get("vesselIds"),
+            "date_range": filters.get("dateRange"),
+        }
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError):
+        return {"path": urlsplit(url).path, "query_keys": sorted(parse_qs(urlsplit(url).query))}
+
+
+def _apply_ais_period(driver, period_cfg, timeout: int = 20) -> None:
+    """Clear the old window before selecting a new range of at most 30 days."""
+    all_period = period_cfg is None or (isinstance(period_cfg, str) and period_cfg.lower() == "all")
+    if not all_period and _period_bounds(period_cfg) is None:
+        raise ValueError("AIS period requires valid From and To dates")
+    base.clear_period_to_all(driver)
+    WebDriverWait(driver, timeout).until(
+        lambda drv: all(
+            not (drv.find_element(By.XPATH, f"//input[@placeholder='{placeholder}']").get_attribute("value") or "").strip()
+            for placeholder in ("From", "To")
+        )
     )
+    if not all_period:
+        applied = base.set_period(
+            driver,
+            period_cfg,
+            allow_from_earliest_fallback=False,
+            allow_to_latest_fallback=False,
+        )
+        if applied is not True:
+            raise TimeoutException(f"AIS period was not applied: {period_cfg}")
+
+
+def _set_ais_local_time_checkbox(driver, value: bool, timeout: int = 5) -> None:
+    """Set the AIS Positions Local Time checkbox in the current tab UI."""
+    locator = (
+        By.XPATH,
+        "//label[normalize-space(.)='Local Time']/preceding-sibling::button[@role='checkbox']",
+    )
+    checkbox = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
+    desired = bool(value)
+    if (checkbox.get_attribute("aria-checked") == "true") != desired:
+        base._safe_click(driver, checkbox)
+        WebDriverWait(driver, timeout).until(
+            lambda drv: (
+                drv.find_element(*locator).get_attribute("aria-checked") == str(desired).lower()
+            )
+        )
+
+
+def _validate_ais_frame_period(frame: pd.DataFrame, period_cfg) -> None:
+    bounds = _period_bounds(period_cfg)
+    if bounds is None or frame.empty:
+        return
+    dates = pd.to_datetime(frame["Date/Time"], format="%H:%M:%S GMT %d/%m/%Y", utc=True, errors="coerce")
+    start, end = bounds
+    # The request sends UTC day boundaries and Local Time is disabled for this
+    # export, so every saved row must belong to the requested UTC date window.
+    invalid = dates.isna() | (dates < pd.Timestamp(start, tz="UTC")) | (
+        dates >= pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)
+    )
+    if invalid.any():
+        examples = frame.loc[invalid, "Date/Time"].head(3).tolist()
+        raise ValueError(f"AIS response dates do not match period {period_cfg}: invalid_rows={int(invalid.sum())}, examples={examples}")
+
+
+def _wait_for_ais_grid_for_response(driver, total_count: int, page_index: int, timeout: int = 20) -> dict:
+    def _matches_response(drv):
+        state = _capture_grid_state(drv)
+        if state.get("total_count") != total_count:
+            return False
+        if state.get("current_page") not in (None, page_index):
+            return False
+        if (state.get("row_count", 0) == 0) != (total_count == 0):
+            return False
+        return state
+
+    return WebDriverWait(driver, timeout).until(_matches_response)
 
 
 def _ais_payload_rows(payload) -> list[dict] | None:
@@ -1749,6 +1880,10 @@ def _ais_payload_rows(payload) -> list[dict] | None:
         return payload if all(isinstance(item, dict) for item in payload) else None
     if not isinstance(payload, dict):
         return None
+
+    if "gridData" in payload:
+        value = payload["gridData"]
+        return value if isinstance(value, list) and all(isinstance(item, dict) for item in value) else None
 
     for key in ("results", "data", "rows", "items", "records", "positions", "aisPositions"):
         value = payload.get(key)
@@ -1764,12 +1899,15 @@ def _ais_payload_rows(payload) -> list[dict] | None:
 def _ais_payload_total(payload) -> int | None:
     if not isinstance(payload, dict):
         return None
-    for key in ("totalMatches", "totalCount", "total", "count"):
+    keys = ("gridResultTotalMatches",) if "gridData" in payload else ("totalMatches", "totalCount", "total", "count")
+    for key in keys:
         value = payload.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return int(value)
         if isinstance(value, str) and value.strip().isdigit():
             return int(value.strip())
+    if "gridData" in payload:
+        return None
     for key in ("pagination", "page", "meta", "data", "results"):
         nested = payload.get(key)
         if isinstance(nested, dict):
@@ -1923,30 +2061,46 @@ def _ais_records_to_frame(records: list[dict]) -> pd.DataFrame:
 
 def _read_current_ais_grid(
     driver,
-    expected_rows: int,
+    expected_rows: int | None,
     expected_total: int | None,
     timeout: int = 30,
+    *,
+    llino,
+    period_cfg,
+    page_index: int,
 ) -> pd.DataFrame:
-    """Read the AIS grid response caused by the latest normal UI action."""
+    """Read only the response to this vessel, full date window, and page."""
     deadline = time.time() + timeout
-    pending_request_ids = set()
+    matching_request_ids = set()
+    pending_request_ids = {}
     seen_row_counts = set()
+    observed_requests = []
+    observed_responses = []
 
     while time.time() < deadline:
         base._raise_if_chrome_page_error(driver)
         for entry in driver.get_log("performance"):
             try:
                 message = json.loads(entry["message"])["message"]
+                params = message.get("params", {})
+                if message.get("method") == "Network.requestWillBeSent":
+                    request = params.get("request", {})
+                    if _ais_response_url_matches(request.get("url", "")) and len(observed_requests) < 6:
+                        observed_requests.append(_ais_request_summary(request))
+                    if _ais_request_matches(request, llino, period_cfg, page_index):
+                        matching_request_ids.add(params["requestId"])
+                    continue
                 if message.get("method") != "Network.responseReceived":
                     continue
-                params = message.get("params", {})
                 response = params.get("response", {})
                 url = response.get("url", "")
                 if not _ais_response_url_matches(url):
                     continue
                 request_id = params.get("requestId")
-                if request_id:
-                    pending_request_ids.add(request_id)
+                if len(observed_responses) < 6:
+                    observed_responses.append({"request_id": request_id, "status": response.get("status")})
+                if request_id in matching_request_ids:
+                    pending_request_ids[request_id] = True
             except (KeyError, TypeError, ValueError):
                 continue
 
@@ -1963,15 +2117,18 @@ def _read_current_ais_grid(
             except Exception:
                 continue
 
-            pending_request_ids.discard(request_id)
+            pending_request_ids.pop(request_id, None)
+            matching_request_ids.discard(request_id)
             if records is None or total is None:
                 continue
             seen_row_counts.add(len(records))
-            if len(records) != expected_rows:
+            required_rows = expected_rows if expected_rows is not None else _expected_ais_page_rows(total, page_index)
+            if total < 0 or len(records) != required_rows:
                 continue
             if expected_total is not None and total != expected_total:
                 continue
             frame = _ais_records_to_frame(records)
+            _validate_ais_frame_period(frame, period_cfg)
             frame.attrs["total_count"] = total
             return frame
 
@@ -1979,7 +2136,9 @@ def _read_current_ais_grid(
 
     raise TimeoutException(
         f"AIS response was not captured: expected_rows={expected_rows}, "
-        f"expected_total={expected_total}, seen_sizes={sorted(seen_row_counts)}"
+        f"expected_total={expected_total}, vessel={llino}, period={period_cfg}, "
+        f"page={page_index}, seen_sizes={sorted(seen_row_counts)}, "
+        f"observed_requests={observed_requests}, observed_responses={observed_responses}"
     )
 
 
@@ -2559,17 +2718,13 @@ def _scraping_ais_positions_single_period(
         phase_started = time.monotonic()
         if not page_ready:
             base._clear_performance_log(driver)
-            base.set_local_time_checkbox(driver, cfg["local_time"])
+            _set_ais_local_time_checkbox(driver, cfg["local_time"])
             if log_steps:
                 logger.info("local_time applied for llino %s", llino)
 
         base._clear_performance_log(driver)
         grid_state_before_period = _capture_grid_state(driver)
-        base.set_period(
-            driver,
-            cfg["period"],
-            allow_from_earliest_fallback=False,
-        )
+        _apply_ais_period(driver, cfg["period"], timeout=period_apply_timeout)
         if log_steps:
             logger.info("period applied for llino %s", llino)
         _sleep_configured_delay(cfg, "period_settle_seconds", "AIS period apply settle")
@@ -2585,25 +2740,6 @@ def _scraping_ais_positions_single_period(
             config=cfg,
         )
         _add_timing_metric(metrics, "period", phase_started)
-
-        if grid_state_after_period.get("row_count", 0) == 0:
-            if not _grid_state_confirms_no_data(driver, grid_state_after_period):
-                raise TimeoutException(
-                    "AIS grid has no visible rows, but no confirmed no-data indicator or total_count=0 was found"
-                )
-            elapsed = time.time() - start
-            _remember_known_no_data_llino(llino, cfg)
-            logger.complete("llino %s finished with no AIS Positions rows (%.2fs)", llino, elapsed)
-            _log_timing_metrics(cfg, llino, period_label, 0, elapsed, metrics)
-            return {
-                "llino": llino,
-                "ok": True,
-                "skipped": True,
-                "status": status,
-                "pages": 0,
-                "elapsed": elapsed,
-                "note": "no-data",
-            }
 
         phase_started = time.monotonic()
         grid_state_before_page_size = grid_state_after_period
@@ -2626,32 +2762,43 @@ def _scraping_ais_positions_single_period(
             )
         else:
             current_grid_state = _capture_grid_state(driver)
+        current_grid_state = _return_to_first_ais_page(driver, current_grid_state, config=cfg)
         _add_timing_metric(metrics, "page_size", phase_started)
         page_frames: list[pd.DataFrame] = []
         page_markers = set()
         page_index = 1
-        expected_total = current_grid_state.get("total_count")
-        expected_rows = _expected_ais_page_rows(
-            expected_total,
-            page_index,
-            fallback_row_count=int(current_grid_state.get("row_count") or 0),
-        )
-        if expected_rows <= 0:
-            raise TimeoutException(f"AIS page {page_index} has no expected rows")
         phase_started = time.monotonic()
         frame = _read_current_ais_grid(
             driver,
-            expected_rows=expected_rows,
-            expected_total=expected_total,
+            expected_rows=None,
+            expected_total=None,
             timeout=page_transition_timeout,
+            llino=llino,
+            period_cfg=cfg["period"],
+            page_index=page_index,
         )
         _add_timing_metric(metrics, "response", phase_started)
-        if expected_total is None:
-            expected_total = int(frame.attrs.get("total_count") or 0)
+        total_count = int(frame.attrs["total_count"])
+        current_grid_state = _wait_for_ais_grid_for_response(
+            driver, total_count, page_index, timeout=page_transition_timeout
+        )
+        if total_count == 0:
+            elapsed = time.time() - start
+            _remember_known_no_data_llino(llino, cfg)
+            logger.complete("llino %s finished with no AIS Positions rows (%.2fs)", llino, elapsed)
+            _log_timing_metrics(cfg, llino, period_label, 0, elapsed, metrics)
+            return {
+                "llino": llino,
+                "ok": True,
+                "skipped": True,
+                "status": status,
+                "pages": 0,
+                "elapsed": elapsed,
+                "note": "no-data",
+            }
         _append_ais_page(frame, page_index, page_frames, page_markers)
         saved_pages += 1
 
-        total_count = int(expected_total or 0)
         total_pages = (total_count + 999) // 1000
         while page_index < total_pages:
             phase_started = time.monotonic()
@@ -2704,8 +2851,14 @@ def _scraping_ais_positions_single_period(
                 expected_rows=expected_rows,
                 expected_total=total_count,
                 timeout=page_transition_timeout,
+                llino=llino,
+                period_cfg=cfg["period"],
+                page_index=page_index,
             )
             _add_timing_metric(metrics, "response", phase_started)
+            current_grid_state = _wait_for_ais_grid_for_response(
+                driver, total_count, page_index, timeout=page_transition_timeout
+            )
             _append_ais_page(frame, page_index, page_frames, page_markers)
             saved_pages += 1
 

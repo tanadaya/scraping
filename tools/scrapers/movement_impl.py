@@ -1708,6 +1708,19 @@ def clear_period_to_all(driver):
             except StaleElementReferenceException:
                 continue
 
+        # Current SeaSearcher UI uses a clickable lucide-circle-x SVG inside
+        # the lli-range-input wrapper instead of the legacy cancel button.
+        clear_icon_xpath = (
+            "//div[contains(concat(' ', normalize-space(@class), ' '), ' lli-range-input ')]"
+            "//*[local-name()='svg' and contains(concat(' ', normalize-space(@class), ' '), ' lucide-circle-x ')]"
+        )
+        for icon in driver.find_elements(By.XPATH, clear_icon_xpath):
+            try:
+                if icon.is_displayed() and _try_click(icon):
+                    return True
+            except StaleElementReferenceException:
+                continue
+
         # 2) 旧フォールバック: Period ラベルの近くを探す
         period_container = None
         for el in driver.find_elements(By.XPATH, "//p[normalize-space(text())='Period']/ancestor::div[1]"):
@@ -1810,353 +1823,8 @@ def _set_input_value(driver, placeholder: str, value: str):
             pass
 
 
-def set_period_to_dates(
-    driver,
-    from_date=None,
-    to_date=None,
-    allow_from_earliest_fallback=True,
-    allow_to_latest_fallback=True,
-):
-    """Set From/To period inputs to the specified dates (each can be None to skip).
-    Preferably targets the two inputs inside the date-range control and sets them sequentially
-    (From first, then To), verifying the value after each set and retrying if necessary.
-    Dates are formatted to 'DD/MM/YYYY' when possible.
-    """
-    logger.info(f"Period を設定します: from={from_date}, to={to_date}")
-    fr = _format_date_for_input(from_date)
-    to = _format_date_for_input(to_date)
-
-    # Find the primary date-range container if present
-    date_range_xpath = (
-        "//div[contains(concat(' ', normalize-space(@class), ' '), ' lli-range-input ')"
-        " and contains(concat(' ', normalize-space(@class), ' '), ' lli-range-input--date ')]"
-    )
-    date_container = None
-    try:
-        for el in driver.find_elements(By.XPATH, date_range_xpath):
-            try:
-                if el.is_displayed():
-                    date_container = el
-                    break
-            except StaleElementReferenceException:
-                continue
-    except Exception:
-        date_container = None
-
-    # Helper to find inputs (prefer container-scoped)
-    def _find_input(placeholder: str):
-        if date_container is not None:
-            try:
-                return date_container.find_element(By.XPATH, f".//input[@placeholder='{placeholder}']")
-            except Exception:
-                pass
-        try:
-            return driver.find_element(By.XPATH, f"//input[@placeholder='{placeholder}']")
-        except Exception:
-            return None
-
-    def _find_inputs():
-        return _find_input("From"), _find_input("To")
-
-    def _read_value(input_el):
-        try:
-            return (
-                driver.execute_script(
-                    "return arguments[0].value || arguments[0].getAttribute('value') || '';",
-                    input_el,
-                )
-                or ""
-            ).strip()
-        except Exception:
-            return ""
-
-    def _verify_value(placeholder: str, expected: str) -> bool:
-        if expected is None:
-            return True
-        input_el = _find_input(placeholder)
-        if input_el is None:
-            return False
-        return _read_value(input_el) == expected
-
-    def _wait_until_value(placeholder: str, expected: str, timeout: float = 5.0) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if _verify_value(placeholder, expected):
-                return True
-            time.sleep(0.15)
-        return _verify_value(placeholder, expected)
-
-    def _set_value_via_keyboard(input_el, expected: str) -> None:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", input_el)
-        try:
-            input_el.click()
-        except Exception:
-            driver.execute_script("arguments[0].focus();", input_el)
-        input_el.send_keys(cmd_or_ctrl(), "a")
-        input_el.send_keys(Keys.DELETE)
-        input_el.send_keys(expected)
-        input_el.send_keys(Keys.ENTER)
-        input_el.send_keys(Keys.TAB)
-
-    def _set_value_via_native_setter(input_el, expected: str) -> None:
-        driver.execute_script(
-            """
-            const el = arguments[0];
-            const value = arguments[1];
-            const descriptor =
-                Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value') ||
-                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-            if (descriptor && descriptor.set) {
-                descriptor.set.call(el, value);
-            } else {
-                el.value = value;
-            }
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new Event('blur', { bubbles: true }));
-            """,
-            input_el,
-            expected,
-        )
-        try:
-            input_el.send_keys(Keys.TAB)
-        except Exception:
-            pass
-
-    def _set_el_value(placeholder: str, expected: str):
-        """Attempt several strategies to set the value on the given input element."""
-        if expected is None:
-            return True
-        attempts = 4
-        for _ in range(attempts):
-            input_el = _find_input(placeholder)
-            if input_el is None:
-                break
-            try:
-                _set_value_via_keyboard(input_el, expected)
-                if _wait_until_value(placeholder, expected):
-                    return True
-            except Exception:
-                logger.debug("_set_el_value: keyboard attempt failed", exc_info=True)
-            time.sleep(0.2)
-
-            input_el = _find_input(placeholder)
-            if input_el is None:
-                break
-            try:
-                _set_value_via_native_setter(input_el, expected)
-                if _wait_until_value(placeholder, expected):
-                    return True
-            except Exception:
-                logger.debug("_set_el_value: native setter attempt failed", exc_info=True)
-            time.sleep(0.2)
-        return False
-
-    def _fallback_from_to_earliest(original_expected: str) -> str | None:
-        logger.warning(
-            "From の設定に失敗しました: %s。選択可能な最古日付へフォールバックします。",
-            original_expected,
-        )
-        try:
-            select_earliest(driver)
-            time.sleep(0.3)
-            actual_from = _read_value(_find_input("From")) if _find_input("From") is not None else ""
-            actual_from = (actual_from or "").strip()
-            if actual_from:
-                logger.info("From のフォールバック結果: %s", actual_from)
-                return actual_from
-        except Exception:
-            logger.debug("From の最古日付フォールバックに失敗しました", exc_info=True)
-        return None
-
-    def _fallback_to_latest(original_expected: str) -> str | None:
-        logger.warning(
-            "To の設定に失敗しました: %s。選択可能な最新日付へフォールバックします。",
-            original_expected,
-        )
-        try:
-            select_latest(driver)
-            time.sleep(0.3)
-            to_input = _find_input("To")
-            actual_to = _read_value(to_input) if to_input is not None else ""
-            actual_to = (actual_to or "").strip()
-            if actual_to:
-                requested_date = datetime.strptime(original_expected, "%d/%m/%Y")
-                actual_date = datetime.strptime(actual_to, "%d/%m/%Y")
-                if actual_date <= requested_date:
-                    logger.info("To のフォールバック結果: %s", actual_to)
-                    return actual_to
-                logger.warning(
-                    "To fallback was rejected because it exceeds the requested end date: %s",
-                    actual_to,
-                )
-        except Exception:
-            logger.debug("To の最新日付フォールバックに失敗しました", exc_info=True)
-        return None
-
-    fr_el, to_el = _find_inputs()
-
-    def _parse_input_date(value: str):
-        try:
-            return datetime.strptime((value or "").strip(), "%d/%m/%Y")
-        except (TypeError, ValueError):
-            return None
-
-    requested_from_date = _parse_input_date(fr)
-    requested_to_date = _parse_input_date(to)
-
-    # Set From then To sequentially
-    if fr is not None:
-        if fr_el is None:
-            raise NoSuchElementException("From input が見つかりません")
-        ok = _set_el_value("From", fr)
-        if not ok:
-            if allow_from_earliest_fallback:
-                fallback_from = _fallback_from_to_earliest(fr)
-                if fallback_from:
-                    fr = fallback_from
-                else:
-                    raise TimeoutException(f"Failed to set From to {fr}")
-            else:
-                logger.warning(
-                    "From could not be set exactly and earliest fallback is disabled: %s",
-                    fr,
-                )
-                raise TimeoutException(f"Failed to set From to {fr}")
-        time.sleep(random.uniform(0.2, 0.6))
-
-    def _requested_to_precedes_actual_from() -> bool:
-        if to is None:
-            return False
-        from_input = _find_input("From")
-        actual_from = _read_value(from_input) if from_input is not None else ""
-        try:
-            actual_from_date = datetime.strptime(actual_from, "%d/%m/%Y")
-            requested_to_date = datetime.strptime(to, "%d/%m/%Y")
-        except ValueError:
-            return False
-        return actual_from_date > requested_to_date
-
-    if to is not None:
-        if to_el is None:
-            raise NoSuchElementException("To input が見つかりません")
-        ok = _set_el_value("To", to)
-        if not ok:
-            if _requested_to_precedes_actual_from():
-                logger.info("Requested period has no overlap with available Movement data")
-                return False
-            if allow_to_latest_fallback:
-                fallback_to = _fallback_to_latest(to)
-                if fallback_to:
-                    to = fallback_to
-                else:
-                    raise TimeoutException(f"Failed to set To to {to}")
-            else:
-                logger.warning(f"To の設定に失敗しました: {to}")
-                raise TimeoutException(f"Failed to set To to {to}")
-        time.sleep(random.uniform(0.2, 0.6))
-
-    # click outside to ensure UI applies
-    try:
-        driver.find_element(By.TAG_NAME, "body").click()
-    except Exception:
-        pass
-
-    # final verification
-    try:
-        if fr is not None and not _verify_value("From", fr):
-            actual_from = _read_value(_find_input("From")) if _find_input("From") is not None else ""
-            requested_from = _parse_input_date(fr)
-            clamped_from = _parse_input_date(actual_from)
-            if allow_from_earliest_fallback and clamped_from and clamped_from >= requested_from:
-                logger.info("From was clamped to the vessel's earliest date: %s", actual_from)
-                fr = actual_from
-            elif allow_from_earliest_fallback:
-                fallback_from = _fallback_from_to_earliest(fr)
-                fallback_from_date = _parse_input_date(fallback_from)
-                if fallback_from_date and requested_from and fallback_from_date >= requested_from:
-                    fr = fallback_from
-                    if requested_to_date and fallback_from_date > requested_to_date:
-                        logger.info("Requested period has no overlap with available Movement data")
-                        return False
-                else:
-                    raise TimeoutException(f"From final verification failed (expected={fr}, actual={actual_from})")
-            else:
-                raise TimeoutException(f"From final verification failed (expected={fr}, actual={actual_from})")
-        if to is not None and not _verify_value("To", to):
-            actual_to = _read_value(_find_input("To")) if _find_input("To") is not None else ""
-            if _requested_to_precedes_actual_from():
-                logger.info("Requested period has no overlap with available Movement data")
-                return False
-            if allow_to_latest_fallback:
-                fallback_to = _fallback_to_latest(to)
-                if fallback_to and _verify_value("To", fallback_to):
-                    to = fallback_to
-                else:
-                    raise TimeoutException(f"To の最終確認に失敗しました (expected={to}, actual={actual_to})")
-            else:
-                raise TimeoutException(f"To の最終確認に失敗しました (expected={to}, actual={actual_to})")
-    except Exception:
-        raise
-
-    final_from = _read_value(_find_input("From")) if _find_input("From") is not None else ""
-    final_to = _read_value(_find_input("To")) if _find_input("To") is not None else ""
-    final_from_date = _parse_input_date(final_from)
-    final_to_date = _parse_input_date(final_to)
-    no_overlap = (
-        (final_from_date and requested_to_date and final_from_date > requested_to_date)
-        or (final_to_date and requested_from_date and final_to_date < requested_from_date)
-        or (final_from_date and final_to_date and final_from_date > final_to_date)
-    )
-    if no_overlap:
-        logger.info("Requested period has no overlap with available Movement data")
-        return False
-
-    return True
 
 
-def set_period(
-    driver,
-    period_cfg,
-    allow_from_earliest_fallback=True,
-    allow_to_latest_fallback=True,
-):
-    """Dispatch period configuration.
-    - period_cfg == 'all' or None -> clear to All
-    - period_cfg is dict-like with 'from'/'to' keys -> set those dates
-    """
-    if period_cfg is None or (isinstance(period_cfg, str) and period_cfg.lower() == "all"):
-        return clear_period_to_all(driver)
-    # dict-like
-    try:
-        if isinstance(period_cfg, dict):
-            return set_period_to_dates(
-                driver,
-                period_cfg.get('from'),
-                period_cfg.get('to'),
-                allow_from_earliest_fallback=allow_from_earliest_fallback,
-                allow_to_latest_fallback=allow_to_latest_fallback,
-            )
-        # also accept tuple/list (from,to)
-        if isinstance(period_cfg, (list, tuple)) and len(period_cfg) == 2:
-            return set_period_to_dates(
-                driver,
-                period_cfg[0],
-                period_cfg[1],
-                allow_from_earliest_fallback=allow_from_earliest_fallback,
-                allow_to_latest_fallback=allow_to_latest_fallback,
-            )
-        # unknown format: attempt to interpret as 'from' only
-        return set_period_to_dates(
-            driver,
-            period_cfg,
-            None,
-            allow_from_earliest_fallback=allow_from_earliest_fallback,
-            allow_to_latest_fallback=allow_to_latest_fallback,
-        )
-    except Exception as e:
-        logger.debug("set_period failed", exc_info=True)
-        raise TimeoutException(f"set_period failed: {e}")
 
 
 def select_status(driver, select_list=('Calls',)):
@@ -4780,16 +4448,17 @@ def _set_period_input_once(
 
         if selectable:
             if search_direction == "forward":
-                _, selected = min(selectable, key=lambda item: item[0])
+                selected_date, selected = min(selectable, key=lambda item: item[0])
             else:
-                _, selected = max(selectable, key=lambda item: item[0])
+                selected_date, selected = max(selectable, key=lambda item: item[0])
+            selected_text = selected_date.strftime("%d/%m/%Y")
             _safe_click(driver, selected)
-            actual = WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 10).until(
                 lambda drv: (
                     drv.find_element(By.XPATH, f"//input[@placeholder='{placeholder}']").get_attribute("value") or ""
-                ).strip()
+                ).strip() == selected_text
             )
-            return actual
+            return selected_text
 
         if boundary_date is not None:
             boundary_month = boundary_date.replace(day=1)
@@ -4819,6 +4488,10 @@ def set_period_to_dates(
     requested_to_text = _format_date_for_input(to_date)
     requested_from = _parse_period_input(requested_from_text)
     requested_to = _parse_period_input(requested_to_text)
+    if requested_from is None or requested_to is None:
+        raise ValueError("Period requires valid From and To dates")
+    if requested_from > requested_to:
+        raise ValueError("Period From date must be on or before To date")
 
     actual_from_text = _set_period_input_once(
         driver,
@@ -4828,6 +4501,10 @@ def set_period_to_dates(
         boundary=requested_to,
     )
     actual_from = _parse_period_input(actual_from_text)
+    if not allow_from_earliest_fallback and actual_from_text != requested_from_text:
+        raise TimeoutException(
+            f"From date does not match requested date: expected={requested_from_text}, actual={actual_from_text}"
+        )
     if actual_from_text != requested_from_text:
         logger.info("From was adjusted to the nearest selectable date: %s", actual_from_text)
     if actual_from and requested_to and actual_from > requested_to:
@@ -4842,6 +4519,10 @@ def set_period_to_dates(
         boundary=actual_from or requested_from,
     )
     actual_to = _parse_period_input(actual_to_text)
+    if not allow_to_latest_fallback and actual_to_text != requested_to_text:
+        raise TimeoutException(
+            f"To date does not match requested date: expected={requested_to_text}, actual={actual_to_text}"
+        )
     if actual_to_text != requested_to_text:
         logger.info("To was adjusted to the nearest selectable date: %s", actual_to_text)
     if (
@@ -4850,6 +4531,15 @@ def set_period_to_dates(
     ):
         logger.info("Requested period has no overlap with available Movement data")
         return False
+    # Selecting To can also change From. Verify both values together after
+    # React has applied the final selection, rather than accepting an old value.
+    WebDriverWait(driver, 10).until(
+        lambda drv: all(
+            (drv.find_element(By.XPATH, f"//input[@placeholder='{placeholder}']").get_attribute("value") or "").strip()
+            == expected
+            for placeholder, expected in (("From", actual_from_text), ("To", actual_to_text))
+        )
+    )
     return True
 
 
@@ -4863,4 +4553,10 @@ def set_period(
         return clear_period_to_all(driver)
     if not isinstance(period_cfg, dict):
         raise ValueError("period must be 'all' or {'from': ..., 'to': ...}")
-    return set_period_to_dates(driver, period_cfg.get("from"), period_cfg.get("to"))
+    return set_period_to_dates(
+        driver,
+        period_cfg.get("from"),
+        period_cfg.get("to"),
+        allow_from_earliest_fallback=allow_from_earliest_fallback,
+        allow_to_latest_fallback=allow_to_latest_fallback,
+    )
