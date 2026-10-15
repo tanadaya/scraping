@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 import pandas as pd
 
 from tools.scrapers import ais_positions as ais
+from tools.coordinator.core import CoordinatorLeaseLostError
 
 
 class FakeElement:
@@ -96,6 +97,18 @@ class NetworkResponseDriver:
 
 
 class PaginationTests(unittest.TestCase):
+    def test_empty_table_placeholder_is_not_a_data_row(self):
+        driver = Mock()
+        driver.find_elements.return_value = [FakeElement(text="There is no data to display.")]
+        self.assertEqual(ais._get_visible_grid_rows(driver), [])
+
+    @patch.object(ais, "_capture_grid_state", return_value={
+        "row_count": 0, "total_count": 0, "current_page": 1, "total_pages": 0,
+    })
+    def test_empty_table_matches_a_confirmed_empty_response(self, _state):
+        state = ais._wait_for_ais_grid_for_response(Mock(), 0, 1, timeout=0)
+        self.assertEqual(state["row_count"], 0)
+
     def test_reads_current_seasearcher_testid_pagination_and_count(self):
         current_page = FakeElement(text="1")
         total_pages = FakeElement(text="2")
@@ -475,6 +488,30 @@ class FailureClassificationTests(unittest.TestCase):
 
 
 class WorkerSessionTests(unittest.TestCase):
+    def test_lease_loss_between_period_windows_stops_before_next_request(self):
+        check = Mock(side_effect=[None, None, None, CoordinatorLeaseLostError("lease expired")])
+        with tempfile.TemporaryDirectory() as out_dir, patch.object(
+            ais, "_scraping_ais_positions_single_period", return_value={"ok": True, "note": "no-data"}
+        ) as scrape:
+            with self.assertRaises(CoordinatorLeaseLostError):
+                ais.scraping_ais_positions(Mock(), 1, config={
+                    "out_dir": out_dir,
+                    "period": {"from": "2026-03-01", "to": "2026-03-31"},
+                    "_coordinator_assert_healthy": check,
+                })
+            self.assertEqual(scrape.call_count, 1)
+
+    @patch.object(ais, "initialize_driver")
+    @patch.object(ais.base, "login_to_seasearcher")
+    @patch.object(ais, "scraping_ais_positions", side_effect=CoordinatorLeaseLostError("lease expired"))
+    def test_lease_loss_propagates_and_closes_browser(self, scrape, login, initialize):
+        driver = FakeDriver()
+        initialize.return_value = login.return_value = driver
+        with self.assertRaises(CoordinatorLeaseLostError):
+            ais._impl.parallel_scraping_ais_positions([1], config=self._config())
+        self.assertEqual(scrape.call_count, 1)
+        self.assertEqual(driver.quit_calls, 1)
+
     def _config(self):
         return {
             "out_dir": "unused-test-output",
@@ -585,6 +622,91 @@ class WorkerSessionTests(unittest.TestCase):
         self.assertEqual(scrape.call_count, 1)
         self.assertEqual(results[0]["error_type"], "access_blocked")
         self.assertEqual(results[1]["error_type"], "run_stopped")
+
+
+class LatestAISSkipTests(unittest.TestCase):
+    def _activity(self):
+        vessel_df = ais.pl.DataFrame(
+            {
+                "LLI NO": [21506, 10526439, 70627],
+                "Latest AIS message timestamp": [
+                    "06 Apr 2011 07:13:11 GMT",
+                    "03 Jun 2026 12:05:51 GMT",
+                    "-",
+                ],
+            }
+        )
+        return ais.build_vessel_activity_index(vessel_df)
+
+    def _config(self, period, **overrides):
+        return {"period": period, "vessel_activity": self._activity(), **overrides}
+
+    def test_activity_index_uses_newest_timestamp_as_snapshot(self):
+        activity = self._activity()
+        self.assertEqual(activity["00021506"]["latest_ais"], ais.date(2011, 4, 6))
+        self.assertEqual(activity["00021506"]["snapshot"], ais.date(2026, 6, 3))
+        self.assertIsNone(activity["00070627"]["latest_ais"])
+
+    def test_duplicate_rows_keep_the_wider_activity(self):
+        index = {}
+        ais._merge_vessel_activity(
+            index, "00000001", {"latest_ais": ais.date(2020, 1, 1), "snapshot": ais.date(2026, 1, 1)}
+        )
+        ais._merge_vessel_activity(
+            index, "00000001", {"latest_ais": ais.date(2022, 1, 1), "snapshot": ais.date(2024, 1, 1)}
+        )
+        self.assertEqual(index["00000001"], {"latest_ais": ais.date(2022, 1, 1), "snapshot": ais.date(2024, 1, 1)})
+
+    def test_windows_after_latest_ais_plus_margin_are_dropped(self):
+        period = {"from": "2008-01-01", "to": "2025-12-31"}
+        windows = ais.build_ais_period_windows(period)
+        kept = ais._drop_known_no_ais_windows(windows, 21506, self._config(period))
+
+        self.assertLess(len(kept), 45)
+        self.assertEqual(max(window["to"] for window in kept), "2011-05-06")
+        self.assertEqual(min(window["from"] for window in kept), "2008-01-01")
+        self.assertEqual(ais._drop_known_no_ais_windows(windows, 70627, self._config(period)), windows)
+        self.assertEqual(ais._drop_known_no_ais_windows(windows, 10526439, self._config(period)), windows)
+
+    def test_period_after_snapshot_is_still_scraped(self):
+        period = {"from": "2026-05-01", "to": "2026-08-31"}
+        windows = ais.build_ais_period_windows(period)
+        kept = ais._drop_known_no_ais_windows(windows, 21506, self._config(period))
+        self.assertTrue(kept)
+        self.assertTrue(all(window["from"] > "2026-06-03" for window in kept))
+        self.assertEqual(max(window["to"] for window in kept), "2026-08-31")
+
+    def test_upfront_filter_skips_vessels_whose_period_is_after_latest_ais(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._config({"from": "2025-01-01", "to": "2025-12-31"}, out_dir=temp_dir)
+            pending, skipped, _, _ = ais._apply_upfront_local_skip_filter([21506, 10526439, 70627], cfg)
+            disabled = {**cfg, "skip_after_latest_ais": False}
+            pending_disabled, _, _, _ = ais._apply_upfront_local_skip_filter([21506], disabled)
+
+        self.assertEqual(pending, [10526439, 70627])
+        self.assertEqual([(r["llino"], r["note"]) for r in skipped], [(21506, "after_latest_ais")])
+        self.assertEqual(pending_disabled, [21506])
+
+    def test_chunked_scrape_only_requests_active_windows(self):
+        requested = []
+
+        def fake_single_period(driver, llino, config=None, **kwargs):
+            requested.append(dict(config["period"]))
+            return {"llino": llino, "ok": True, "skipped": True, "note": "no-data"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cfg = self._config(
+                {"from": "2008-01-01", "to": "2025-12-31"},
+                out_dir=temp_dir,
+                remember_no_data=False,
+            )
+            with patch.object(ais, "_scraping_ais_positions_single_period", side_effect=fake_single_period):
+                result = ais.scraping_ais_positions(object(), 21506, config=cfg)
+
+        self.assertEqual(result["note"], "no-data")
+        self.assertEqual(result["windows"], len(requested))
+        self.assertEqual(max(window["to"] for window in requested), "2011-05-06")
+        self.assertEqual(min(window["from"] for window in requested), "2008-01-01")
 
 
 if __name__ == "__main__":

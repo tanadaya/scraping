@@ -38,6 +38,7 @@ def parallel_scraping_ais_positions(llino_list, max_workers=1, driver_opts=None,
         total=len(targets),
         description=description,
     ) as coordinator_job:
+        cfg["_coordinator_assert_healthy"] = coordinator_job.assert_healthy
         with track_unique_function_calls(
             _impl,
             "scraping_ais_positions",

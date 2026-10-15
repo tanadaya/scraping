@@ -71,6 +71,7 @@ class JobLease:
         self._stop_event = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
+        self._heartbeat_lock = threading.Lock()
         self._completed = 0
         self._message = self.description
         self._eta_at: str | None = None
@@ -111,8 +112,15 @@ class JobLease:
         self._acquired = True
         self._started_monotonic = time.monotonic()
         self._eta_baseline_completed = 0
+        try:
+            self._send_heartbeat(force=True)
+        except Exception:
+            try:
+                self.release(status="failed", message="Initial heartbeat failed")
+            except Exception as release_exc:
+                print(f"WARNING: failed to release coordinator job {self.job_id}: {release_exc}")
+            raise
         self._start_heartbeat_thread()
-        self._send_heartbeat(force=True)
 
     def _wait_until_running(self, response: dict[str, Any]) -> None:
         last_summary: tuple[Any, ...] | None = None
@@ -177,8 +185,38 @@ class JobLease:
         while not self._stop_event.wait(self.client.heartbeat_interval_seconds):
             try:
                 self._send_heartbeat(force=True)
-                self._heartbeat_failures = 0
+            except CoordinatorUnavailableError:
+                # A later successful heartbeat can restore the same lease.
+                continue
             except Exception as exc:
+                self._health_error = exc
+                print(f"WARNING: coordinator lease is unhealthy: {exc}")
+                return
+
+    def _snapshot(self) -> tuple[int, int | None, str | None, str]:
+        with self._state_lock:
+            return self._completed, self.total, self._eta_at, self._message
+
+    def _send_heartbeat(self, *, force: bool = False) -> None:
+        if not self._acquired and not force:
+            return
+        # The timer and progress callback may both send heartbeats.
+        with self._heartbeat_lock:
+            if self._health_error is not None and not isinstance(
+                self._health_error, CoordinatorUnavailableError
+            ):
+                raise self._health_error
+            completed, total, eta_at, message = self._snapshot()
+            try:
+                self.client.transport.post(
+                    "heartbeat",
+                    job_id=self.job_id,
+                    completed=completed,
+                    total=total,
+                    eta_at=eta_at,
+                    message=message,
+                )
+            except CoordinatorUnavailableError as exc:
                 self._heartbeat_failures += 1
                 print(
                     f"WARNING: coordinator heartbeat failed "
@@ -188,26 +226,19 @@ class JobLease:
                     self._health_error = CoordinatorUnavailableError(
                         "Coordinator heartbeat repeatedly failed; stopping is required before the lease expires"
                     )
-
-    def _snapshot(self) -> tuple[int, int | None, str | None, str]:
-        with self._state_lock:
-            return self._completed, self.total, self._eta_at, self._message
-
-    def _send_heartbeat(self, *, force: bool = False) -> None:
-        if not self._acquired and not force:
-            return
-        completed, total, eta_at, message = self._snapshot()
-        self.client.transport.post(
-            "heartbeat",
-            job_id=self.job_id,
-            completed=completed,
-            total=total,
-            eta_at=eta_at,
-            message=message,
-        )
-        self._last_progress_push = time.monotonic()
+                raise
+            except Exception as exc:
+                self._health_error = exc
+                raise
+            self._last_progress_push = time.monotonic()
+            self._heartbeat_failures = 0
+            self._health_error = None
 
     def assert_healthy(self) -> None:
+        if isinstance(self._health_error, CoordinatorUnavailableError):
+            # Revalidate ownership before stopping for an old network error.
+            # The server rejects this heartbeat if the lease expired or moved.
+            self._send_heartbeat(force=True)
         if self._health_error is not None:
             raise self._health_error
 
@@ -266,7 +297,10 @@ class JobLease:
             or now_mono - self._last_progress_push >= self.client.progress_push_interval_seconds
         )
         if should_push:
-            self._send_heartbeat(force=True)
+            try:
+                self._send_heartbeat(force=True)
+            except CoordinatorUnavailableError:
+                self.assert_healthy()
 
     def release(
         self,

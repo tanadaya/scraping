@@ -94,6 +94,7 @@ def track_unique_function_calls(
     )
 
     def wrapped(*args: Any, **kwargs: Any):
+        job.assert_healthy()
         result = None
         key = None
         if len(args) > key_arg_index:

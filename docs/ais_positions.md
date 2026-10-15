@@ -209,6 +209,13 @@ results = sss_ais.parallel_scraping_ais_positions(
 - `skip_if_exists`
   - 既に `out_dir` に同じ LLI の AIS CSV がある場合はスキップ
   - `parallel_scraping_ais_positions(...)` では実行前に一括でローカル確認し、既存 CSV がある LLI は worker に渡しません
+- `skip_after_latest_ais`
+  - `True` で vessel CSV の `Latest AIS message timestamp` より後の期間窓を取得しません（既定 `True`）
+  - 期間全体が最終AIS受信日より後の船は、ブラウザを開かずに `note="after_latest_ais"` としてスキップします
+  - CSV のスナップショット日（CSV内で最も新しい `Latest AIS message timestamp`）より後の期間は、これまでどおり取得します
+  - ノートブックでは `SCRAPING_CONFIG["vessel_activity"] = run_context["vessel_activity"]` で有効になります。`vessel_activity` を渡さない場合は従来どおり全期間を取得します
+- `latest_ais_margin_days`
+  - 最終AIS受信日の後、念のため取得を続ける日数（既定 `30`）。最終受信日の翌日のデータが存在した例があるため余裕を持たせています
 - `show_progress`
   - 進捗表示を出す
 - `periodic_rest_enabled`
@@ -246,6 +253,7 @@ results = sss_ais.parallel_scraping_ais_positions(
 - Fromだけを変更した途中の検索や、前の期間の遅れて届いた応答は採用しません。件数が同じという理由で応答を選びません
 - 表用の `gridData` と `gridResultTotalMatches` を使用します。地図用の `aisPoints` と件数はCSVの取得対象にしません
 - 0件の判定も、今回の検索条件に一致したAPI応答で行います。更新前の画面だけを見てデータなしとは記録しません
+- 0件の表に表示される `There is no data to display.` の案内行はデータ行に数えません
 - `Local Time=False` の取得では各行の `Date/Time` が指定したUTC日付範囲内にあることを確認します。範囲外や日時不明の行があれば、その窓を失敗として再試行し、CSVへ保存しません
 - 全ページの行数が表の総件数に一致することを確認してCSVへ保存します。複数の期間窓は結合後に一時CSVを削除します
 - `periodic_rest_enabled=True` のときは、各 worker が `work_session_hours` を基準に前後 `work_session_random_minutes` 分のランダム幅を持たせて動き、休止時も `rest_session_hours` を基準に前後 `rest_session_random_minutes` 分だけランダムに休みます

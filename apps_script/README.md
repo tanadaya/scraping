@@ -61,6 +61,7 @@ uv run --locked python -m tools.coordinator status
 
 - Coordinator URL / token が未設定ならスクレイピングは開始しません（fail closed）。
 - 実行中は60秒ごとに heartbeat を送ります。
+- 一時的な通信失敗は成功した heartbeat で解除します。連続失敗後は再開前に heartbeat で同じロックを保持していることを確認し、通信障害の継続やロック失効時は停止します。AIS は船・期間窓・ページの切り替え時にも確認します。
 - heartbeat が途絶えて lease が切れたジョブは `EXPIRED` になります。
 - 待機中プロセスが終了して poll が途絶えると `ABANDONED` になります。
 - `LockService.getScriptLock()` により、複数PCが完全に同時に予約を試みても Sheet 更新は直列化されます。

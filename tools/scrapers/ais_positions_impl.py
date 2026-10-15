@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 import pandas as pd
 import polars as pl
 from . import movement as base
+from tools.coordinator.core import CoordinatorError
 from selenium import webdriver
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
@@ -64,6 +65,11 @@ DEFAULT_AIS_POSITIONS_CONFIG = {
     "skip_if_exists": True,
     "skip_if_known_no_data": True,
     "remember_no_data": True,
+    # Skip period windows after a vessel's "Latest AIS message timestamp"
+    # (from the vessel CSV) up to the CSV snapshot date. Requires vessel_activity.
+    "skip_after_latest_ais": True,
+    "latest_ais_margin_days": 30,
+    "vessel_activity": None,
     "show_progress": True,
     "encoding": "utf-8-sig",
     "log_steps": False,
@@ -139,6 +145,7 @@ _SOURCE_MODE_SINGLE_FILE = "single_file"
 _SOURCE_MODE_SPLIT_FILES = "split_files"
 _REQUIRED_VESSEL_SOURCE_COLUMNS = {"LLI NO", "Status", "LLI Vessel Type"}
 _UNKNOWN_VESSEL_TYPE = "(Unknown)"
+_LATEST_AIS_COLUMN = "Latest AIS message timestamp"
 _AIS_NO_DATA_CACHE_LOCK = threading.Lock()
 _CHROMEDRIVER_PATH_LOCK = threading.Lock()
 _CHROMEDRIVER_PATH: str | None = None
@@ -577,6 +584,113 @@ def _normalize_source_statuses(statuses) -> list[str] | None:
     return normalized or ["Live"]
 
 
+def _parse_latest_ais_date(value) -> date | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    for fmt in ("%d %b %Y %H:%M:%S GMT", "%d %b %Y %H:%M:%S", "%d %b %Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _merge_vessel_activity(index: dict, token: str, entry: dict) -> None:
+    current = index.get(token)
+    if current is None:
+        index[token] = dict(entry)
+        return
+    # Duplicate LLI rows: keep the wider activity and the older snapshot.
+    if current["latest_ais"] is None or entry["latest_ais"] is None:
+        current["latest_ais"] = None
+    else:
+        current["latest_ais"] = max(current["latest_ais"], entry["latest_ais"])
+    current["snapshot"] = min(current["snapshot"], entry["snapshot"])
+
+
+def build_vessel_activity_index(vessel_df: pl.DataFrame) -> dict[str, dict]:
+    """Map LLI NO to its latest AIS date and the source CSV snapshot date.
+
+    The snapshot is the newest latest-AIS date in the frame, so the CSV was
+    exported on or after it. Between a vessel's latest AIS message and the
+    snapshot the vessel is known to have no AIS data.
+    """
+    if _LATEST_AIS_COLUMN not in vessel_df.columns or "LLI NO" not in vessel_df.columns:
+        return {}
+
+    entries = []
+    for llino, value in zip(
+        vessel_df.get_column("LLI NO").to_list(),
+        vessel_df.get_column(_LATEST_AIS_COLUMN).to_list(),
+    ):
+        try:
+            token = _format_llino(llino)
+        except (TypeError, ValueError):
+            continue
+        entries.append((token, _parse_latest_ais_date(value)))
+
+    known_dates = [latest for _, latest in entries if latest is not None]
+    if not known_dates:
+        return {}
+    snapshot = max(known_dates)
+
+    index: dict[str, dict] = {}
+    for token, latest in entries:
+        _merge_vessel_activity(index, token, {"latest_ais": latest, "snapshot": snapshot})
+    return index
+
+
+def _known_no_ais_range(llino, cfg=None) -> tuple[date, date] | None:
+    cfg = cfg or {}
+    if not bool(cfg.get("skip_after_latest_ais", True)):
+        return None
+    activity = cfg.get("vessel_activity")
+    if not isinstance(activity, dict):
+        return None
+    entry = activity.get(_format_llino(llino))
+    if not entry:
+        return None
+    latest = _parse_period_date(entry.get("latest_ais"))
+    snapshot = _parse_period_date(entry.get("snapshot"))
+    if latest is None or snapshot is None:
+        return None
+
+    margin_days = max(0, int(cfg.get("latest_ais_margin_days", 30)))
+    start = latest + timedelta(days=margin_days + 1)
+    if start > snapshot:
+        return None
+    return start, snapshot
+
+
+def _drop_known_no_ais_windows(windows, llino, cfg=None) -> list[dict[str, str]]:
+    no_data_range = _known_no_ais_range(llino, cfg)
+    if no_data_range is None:
+        return [dict(window) for window in windows]
+
+    gap_start, gap_end = no_data_range
+    kept = []
+    for window in windows:
+        start = _parse_period_date(window["from"])
+        end = _parse_period_date(window["to"])
+        if gap_start <= start and end <= gap_end:
+            continue
+        if gap_start <= start <= gap_end:
+            start = gap_end + timedelta(days=1)
+        elif gap_start <= end <= gap_end:
+            end = gap_start - timedelta(days=1)
+        kept.append({"from": start.isoformat(), "to": end.isoformat()})
+    return kept
+
+
+def _period_is_after_latest_ais(llino, cfg=None) -> bool:
+    bounds = _period_bounds((cfg or {}).get("period"))
+    if bounds is None:
+        return False
+    whole_period = {"from": bounds[0].isoformat(), "to": bounds[1].isoformat()}
+    return not _drop_known_no_ais_windows([whole_period], llino, cfg)
+
+
 def load_ais_vessel_source(source_config=None) -> dict:
     cfg = {**DEFAULT_AIS_SOURCE_CONFIG, **(source_config or {})}
     source_mode = str(cfg.get("source_mode", _SOURCE_MODE_SPLIT_FILES)).strip().lower()
@@ -589,6 +703,7 @@ def load_ais_vessel_source(source_config=None) -> dict:
         if not source_path.exists():
             raise FileNotFoundError(f"Vessel CSV not found: {source_path}")
         vessel_df = pl.read_csv(source_path, ignore_errors=True)
+        vessel_activity = build_vessel_activity_index(vessel_df)
         source_description = str(source_path)
         source_name = source_path.stem
         file_path_dict = {}
@@ -601,6 +716,7 @@ def load_ais_vessel_source(source_config=None) -> dict:
             for vessel_type in vessel_type_list
         }
         vessel_frames = []
+        vessel_activity = {}
         for vessel_type, file_path in file_path_dict.items():
             source_path = Path(file_path)
             if not source_path.exists():
@@ -609,6 +725,9 @@ def load_ais_vessel_source(source_config=None) -> dict:
             if "LLI Vessel Type" not in frame.columns:
                 frame = frame.with_columns(pl.lit(vessel_type).alias("LLI Vessel Type"))
             vessel_frames.append(frame)
+            # Each file is its own snapshot, so index it before concatenating.
+            for token, entry in build_vessel_activity_index(frame).items():
+                _merge_vessel_activity(vessel_activity, token, entry)
         vessel_df = pl.concat(vessel_frames, how="diagonal_relaxed") if vessel_frames else pl.DataFrame()
         source_description = f"split_files ({len(file_path_dict)} files)"
         source_name = "split_files"
@@ -659,6 +778,7 @@ def load_ais_vessel_source(source_config=None) -> dict:
         "source_statuses": source_statuses,
         "vessel_type_list": vessel_type_list,
         "llino_list_dict": llino_list_dict,
+        "vessel_activity": vessel_activity,
     }
 
 
@@ -907,7 +1027,9 @@ def _get_visible_grid_rows(driver) -> list:
         visible_rows = []
         for row in driver.find_elements(By.XPATH, xpath):
             try:
-                if row.is_displayed():
+                if row.is_displayed() and _normalize_text(row.text).lower() not in {
+                    "there is no data to display.", "no data to display",
+                }:
                     visible_rows.append(row)
             except StaleElementReferenceException:
                 continue
@@ -1371,6 +1493,18 @@ def _build_known_no_data_result(llino) -> dict:
     }
 
 
+def _build_after_latest_ais_result(llino) -> dict:
+    return {
+        "llino": llino,
+        "ok": True,
+        "skipped": True,
+        "status": None,
+        "pages": 0,
+        "elapsed": 0.0,
+        "note": "after_latest_ais",
+    }
+
+
 def _ais_no_data_cache_path(cfg=None) -> Path:
     out_dir = Path((cfg or {}).get("out_dir", DEFAULT_AIS_POSITIONS_CONFIG["out_dir"]))
     period_label = _period_label((cfg or {}).get("period"))
@@ -1423,13 +1557,8 @@ def _apply_upfront_local_skip_filter(llino_list, cfg=None):
     llino_list = list(llino_list or [])
     use_saved_skip = bool((cfg or {}).get("skip_if_exists", True))
     use_known_no_data_skip = bool((cfg or {}).get("skip_if_known_no_data", True))
-    if not use_saved_skip and not use_known_no_data_skip:
-        return llino_list, [], set(), set()
-
     saved_outputs_index = _collect_saved_ais_positions_index(cfg) if use_saved_skip else set()
     known_no_data_index = _collect_known_no_data_index(cfg) if use_known_no_data_skip else set()
-    if not saved_outputs_index and not known_no_data_index:
-        return llino_list, [], saved_outputs_index, known_no_data_index
 
     pending_llinos = []
     skipped_results = []
@@ -1439,6 +1568,8 @@ def _apply_upfront_local_skip_filter(llino_list, cfg=None):
             skipped_results.append(_build_already_exists_result(llino))
         elif token in known_no_data_index:
             skipped_results.append(_build_known_no_data_result(llino))
+        elif _period_is_after_latest_ais(llino, cfg):
+            skipped_results.append(_build_after_latest_ais_result(llino))
         else:
             pending_llinos.append(llino)
 
@@ -2263,8 +2394,15 @@ def _period_window_no_data_marker(window_out_dir: Path, llino_token: str, window
     return window_out_dir / f".ais_positions_{llino_token}_{window_label}_no_data"
 
 
+def _assert_coordinator_healthy(cfg) -> None:
+    check = cfg.get("_coordinator_assert_healthy")
+    if check is not None:
+        check()
+
+
 def scraping_ais_positions(driver, llino, config=None, *, download_dir=None, reload_current_page=False):
     cfg = {**DEFAULT_AIS_POSITIONS_CONFIG, **(config or {})}
+    _assert_coordinator_healthy(cfg)
     start = time.time()
     run_id = _make_run_id()
     llino_token = _format_llino(llino)
@@ -2282,10 +2420,31 @@ def scraping_ais_positions(driver, llino, config=None, *, download_dir=None, rel
             order=cfg.get("period_chunk_order", DEFAULT_AIS_POSITIONS_CONFIG["period_chunk_order"]),
         )
 
+    if _period_is_after_latest_ais(llino, cfg):
+        logger.complete(
+            "llino %s: skipped because the period is after its latest AIS message (skip_after_latest_ais=True)",
+            llino,
+        )
+        result = _build_after_latest_ais_result(llino)
+        result.update({"windows": 0, "period_windows": [], "output_path": str(output_path)})
+        return result
+
+    # Decide chunking on the requested period so the output keeps its full-period name.
+    chunked = len(period_windows) > 1
+    if chunked:
+        active_windows = _drop_known_no_ais_windows(period_windows, llino, cfg)
+        if len(active_windows) < len(period_windows):
+            logger.complete(
+                "llino %s: skipping %s period window(s) after its latest AIS message",
+                llino,
+                len(period_windows) - len(active_windows),
+            )
+        period_windows = active_windows
+
     result_period_windows = [dict(window) for window in period_windows]
     window_count = len(period_windows) if period_windows else 1
 
-    if not period_windows or len(period_windows) == 1:
+    if not chunked:
         result = _scraping_ais_positions_single_period(
             driver,
             llino,
@@ -2361,6 +2520,7 @@ def scraping_ais_positions(driver, llino, config=None, *, download_dir=None, rel
     )
 
     for index, window in enumerate(period_windows, start=1):
+        _assert_coordinator_healthy(cfg)
         stop_event = cfg.get("_stop_event")
         if stop_event is not None and stop_event.is_set():
             return {
@@ -2426,6 +2586,7 @@ def scraping_ais_positions(driver, llino, config=None, *, download_dir=None, rel
         sub_cfg.pop("_known_no_data_index", None)
         result = None
         for window_attempt in range(1, period_window_retry_attempts + 2):
+            _assert_coordinator_healthy(cfg)
             result = _scraping_ais_positions_single_period(
                 driver,
                 llino,
@@ -2801,6 +2962,7 @@ def _scraping_ais_positions_single_period(
 
         total_pages = (total_count + 999) // 1000
         while page_index < total_pages:
+            _assert_coordinator_healthy(cfg)
             phase_started = time.monotonic()
             grid_state_before_next_page = current_grid_state
             base._clear_performance_log(driver)
@@ -2897,6 +3059,8 @@ def _scraping_ais_positions_single_period(
             "run_id": run_id,
         }
 
+    except CoordinatorError:
+        raise
     except TimeoutException as exc:
         elapsed = time.time() - start
         failure_flags = _ais_browser_failure_flags(driver, exc)
@@ -3003,7 +3167,8 @@ def worker_thread_ais_positions(
 
     out_dir = Path(cfg["out_dir"])
     retry_failed = bool(cfg.get("retry_failed_llino_after_wait", True))
-    max_attempts = max(1, int(cfg.get("failed_llino_retry_max_attempts", 2) or 2))
+    configured_attempts = cfg.get("failed_llino_retry_max_attempts")
+    max_attempts = max(1, int(2 if configured_attempts is None else configured_attempts))
     retry_wait_minutes = float(cfg.get("failed_llino_retry_wait_minutes", 30))
     retry_random_minutes = float(cfg.get("failed_llino_retry_random_minutes", 5))
     relogin_enabled = bool(cfg.get("relogin_on_confirmed_session_loss", True))
@@ -3099,6 +3264,8 @@ def worker_thread_ais_positions(
                         llino,
                         config=cfg,
                     )
+                except CoordinatorError:
+                    raise
                 except WebDriverException as exc:
                     res = {
                         "llino": llino,
@@ -3151,6 +3318,8 @@ def worker_thread_ais_positions(
                         if isinstance(retry_res, dict):
                             retry_res["browser_reload_retry"] = True
                             res = retry_res
+                    except CoordinatorError:
+                        raise
                     except Exception as retry_exc:
                         res = {
                             "llino": llino,
@@ -3345,7 +3514,7 @@ def parallel_scraping_ais_positions(llino_list, max_workers=1, driver_opts=None,
             runtime_config["_saved_outputs_index"] = saved_outputs_index
         if bool(runtime_config.get("skip_if_known_no_data", True)):
             runtime_config["_known_no_data_index"] = known_no_data_index
-        if saved_outputs_index or known_no_data_index:
+        if upfront_skipped_results:
             logger.complete(
                 "%s upfront local AIS cache check: %s skipped, %s pending",
                 pass_label,
@@ -3397,6 +3566,8 @@ def parallel_scraping_ais_positions(llino_list, max_workers=1, driver_opts=None,
                                 sys.stdout.flush()
                             except Exception:
                                 pass
+                    except CoordinatorError:
+                        raise
                     except Exception as exc:
                         logger.error("[parallel] Error in AIS worker thread: %s", exc, exc_info=True)
 

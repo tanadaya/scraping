@@ -42,6 +42,75 @@ class FakeTransport:
 
 
 class CoordinatorTests(unittest.TestCase):
+    def _job_with_heartbeat_results(self, results):
+        transport = mock.Mock()
+        transport.post.side_effect = results
+        client = coordinator.ScrapeCoordinatorClient(transport)
+        job = client.job(account_id="account_1", job_type="ais_positions", total=10)
+        job._acquired = True
+        return job, transport
+
+    def test_successful_heartbeat_clears_previous_network_failure(self):
+        job, _ = self._job_with_heartbeat_results([
+            coordinator.CoordinatorUnavailableError("temporary outage")
+            for _ in range(3)
+        ] + [{"ok": True}])
+        job._stop_event = mock.Mock()
+        job._stop_event.wait.side_effect = [False, False, False, False, True]
+        job._heartbeat_loop()
+        job.assert_healthy()
+        self.assertEqual(job._heartbeat_failures, 0)
+        self.assertIsNone(job._health_error)
+
+    def test_health_check_revalidates_after_network_failure(self):
+        job, transport = self._job_with_heartbeat_results([{"ok": True}])
+        job._health_error = coordinator.CoordinatorUnavailableError("old outage")
+        job.assert_healthy()
+        self.assertEqual(transport.post.call_args.args[0], "heartbeat")
+        self.assertIsNone(job._health_error)
+
+    def test_health_check_stops_if_outage_continues(self):
+        job, _ = self._job_with_heartbeat_results([
+            coordinator.CoordinatorUnavailableError("still unavailable")
+        ])
+        job._health_error = coordinator.CoordinatorUnavailableError("old outage")
+        with self.assertRaises(coordinator.CoordinatorUnavailableError):
+            job.assert_healthy()
+
+    def test_lost_lease_is_not_cleared_or_retried(self):
+        job, transport = self._job_with_heartbeat_results([
+            coordinator.CoordinatorLeaseLostError("lease expired"), {"ok": True}
+        ])
+        with self.assertRaises(coordinator.CoordinatorLeaseLostError):
+            job._send_heartbeat()
+        with self.assertRaises(coordinator.CoordinatorLeaseLostError):
+            job.assert_healthy()
+        with self.assertRaises(coordinator.CoordinatorLeaseLostError):
+            job._send_heartbeat()
+        self.assertEqual(transport.post.call_count, 1)
+
+    def test_progress_survives_one_transient_network_failure(self):
+        job, _ = self._job_with_heartbeat_results([
+            coordinator.CoordinatorUnavailableError("temporary outage"), {"ok": True}
+        ])
+        job.progress_callback(completed=1, stage="local_skip")
+        self.assertEqual(job._completed, 1)
+        job.progress_callback(completed=2, stage="local_skip")
+        self.assertEqual(job._heartbeat_failures, 0)
+
+    def test_initial_heartbeat_failure_releases_reservation(self):
+        job, transport = self._job_with_heartbeat_results([
+            {"job": {"status": "RUNNING"}},
+            coordinator.CoordinatorUnavailableError("temporary outage"),
+            {"ok": True},
+        ])
+        job._acquired = False
+        with self.assertRaises(coordinator.CoordinatorUnavailableError):
+            job.acquire()
+        self.assertFalse(job._acquired)
+        self.assertIsNone(job._heartbeat_thread)
+        self.assertEqual(transport.post.call_args.args[0], "release")
+
     def test_job_waits_then_acquires_and_releases(self):
         transport = FakeTransport()
         client = coordinator.ScrapeCoordinatorClient(
@@ -91,6 +160,9 @@ class CoordinatorTests(unittest.TestCase):
 
             def progress_callback(self, **kwargs):
                 self.progress.append(kwargs)
+
+            def assert_healthy(self):
+                pass
 
         job = Job()
         original = module.scrape
